@@ -11,7 +11,7 @@
 <meta name="format-detection" content="telephone=no">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="strict-origin-when-cross-origin">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob:; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https://cdn.jsdelivr.net https://cdn.tailwindcss.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob:; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https://cdn.jsdelivr.net https://cdn.tailwindcss.com https://*.supabase.co wss://*.supabase.co; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'">
 <title>কর্মচারী ব্যবস্থাপনা সিস্টেম - জয়পুরহাট</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -3768,9 +3768,13 @@ function doLogin(e) {
     setLoginError(true, 'ইউজারনেম বা পাসওয়ার্ড ভুল!');
     return false;
   }
-  if (user.pendingApproval || user.approved === false || user.active === false) {
+  if (typeof isUserApproved === 'function' ? !isUserApproved(user) : (user.pendingApproval || user.approved === false || user.active === false)) {
     setLoginError(true, '⚠️ অনুমোদন নেই — অ্যাডমিন এখনো আপনার অ্যাকাউন্ট অনুমোদন করেননি। অনুমোদনের পর লগইন করুন।');
     try { if (typeof showToast === 'function') showToast('অনুমোদন নেই — লগইন বন্ধ', 'err'); } catch (_) {}
+    return false;
+  }
+  if (!user.password && user.password !== '') {
+    setLoginError(true, 'এই অ্যাকাউন্টে পাসওয়ার্ড সেট নেই। অ্যাডমিনকে পাসওয়ার্ড রিসেট করতে বলুন।');
     return false;
   }
   if (btn) { btn.disabled = true; btn.textContent = 'যাচাই হচ্ছে…'; }
@@ -3791,7 +3795,7 @@ function doLogin(e) {
       setLoginError(true, 'ইউজারনেম বা পাসওয়ার্ড ভুল!');
       return;
     }
-    if (user.pendingApproval || user.approved === false || user.active === false) {
+    if (typeof isUserApproved === 'function' ? !isUserApproved(user) : (user.pendingApproval || user.approved === false || user.active === false)) {
       setLoginError(true, '⚠️ অনুমোদন নেই — অ্যাডমিন এখনো আপনার অ্যাকাউন্ট অনুমোদন করেননি।');
       try { if (typeof showToast === 'function') showToast('অনুমোদন নেই', 'err'); } catch (_) {}
       return;
@@ -5564,9 +5568,13 @@ function changePassword(e) {
 /* ---- Subordinate user management (admin only) ---- */
 function isUserApproved(u) {
   if (!u) return false;
-  if (u.role === 'admin' && String(u.username || '').toLowerCase() === 'admin') return true;
+  var un = String(u.username || '').toLowerCase();
+  // Seed / primary admin always approved
+  if (u.role === 'admin' && (un === 'admin' || un === String(AUTH_USER || '').toLowerCase())) return true;
   if (u.pendingApproval === true || u.approved === false) return false;
   if (u.active === false) return false;
+  // Legacy records without approved flag → treat as approved if active !== false
+  if (u.approved === undefined && u.pendingApproval === undefined) return u.active !== false;
   return true;
 }
 function approveUser(username) {
@@ -6071,21 +6079,38 @@ function createSubUser(e) {
     list[idx].updatedAt = new Date().toISOString();
     list[idx].updatedBy = getCurrentUsername();
     if (pass) {
-      hashPassword(pass).then(function(h) {
-        list[idx].password = h;
+      var plainEdit = String(pass || '');
+      if (typeof hashPassword === 'function') {
+        hashPassword(plainEdit).then(function(h) {
+          list[idx].password = h || plainEdit;
+          finishSave(list, editOriginal, true);
+        }).catch(function() {
+          list[idx].password = plainEdit;
+          finishSave(list, editOriginal, true);
+        });
+      } else {
+        list[idx].password = plainEdit;
         finishSave(list, editOriginal, true);
-      });
+      }
     } else {
       finishSave(list, editOriginal, true);
     }
     return false;
   }
 
-  hashPassword(pass).then(function(h) {
-    const list = getUsers();
-    list.push({
+  // Admin-created users: force active+approved (status dropdown is edit-only).
+  // Hash password robustly; on failure store plain so login still works via verifyPassword legacy path.
+  var plainPass = String(pass || '');
+  function pushNewUser(hashedOrPlain) {
+    var list = getUsers();
+    // Re-check uniqueness in case of race
+    if (list.some(function(x) { return x && String(x.username || '').toLowerCase() === username.toLowerCase(); })) {
+      show('এই ইউজারনেম ইতিমধ্যে আছে।', false);
+      return;
+    }
+    var obj = {
       username: username,
-      password: h,
+      password: hashedOrPlain,
       role: role,
       fullName: fullName,
       fullNameEn: fullNameEn,
@@ -6095,9 +6120,41 @@ function createSubUser(e) {
       pendingApproval: false,
       createdAt: new Date().toISOString(),
       createdBy: getCurrentUsername()
-    });
+    };
+    applyStatus(obj); // respect status if visible; default stays active
+    // Always ensure admin-created accounts can log in unless explicitly pending/inactive
+    if (statusVal !== 'pending' && statusVal !== 'inactive') {
+      obj.active = true;
+      obj.approved = true;
+      obj.pendingApproval = false;
+    }
+    list.push(obj);
     finishSave(list, username, false);
-  });
+    // Self-test: verify the saved password can be checked (same-browser sanity)
+    try {
+      if (typeof verifyPassword === 'function') {
+        verifyPassword(plainPass, obj.password).then(function(ok) {
+          if (!ok) {
+            console.warn('EMS: created user password verify failed — storing plain fallback');
+            obj.password = plainPass;
+            var list2 = getUsers();
+            var i2 = list2.findIndex(function(x) { return x && String(x.username || '').toLowerCase() === username.toLowerCase(); });
+            if (i2 >= 0) { list2[i2].password = plainPass; setUsers(list2); }
+          }
+        }).catch(function() {});
+      }
+    } catch (_) {}
+  }
+  if (typeof hashPassword === 'function') {
+    hashPassword(plainPass).then(function(h) {
+      pushNewUser(h || plainPass);
+    }).catch(function(err) {
+      console.warn('hashPassword failed on create', err);
+      pushNewUser(plainPass);
+    });
+  } else {
+    pushNewUser(plainPass);
+  }
   return false;
 }
 function deleteSubUser(username) {
@@ -9665,39 +9722,6 @@ ${html}
     }
   };
 <\/script>
-
-<style id="admin-only-users-lock">
-/* ইউজার ব্যবস্থাপনা — ডিফল্ট লুকানো; শুধু body.ems-is-admin এ দেখা যাবে */
-#tab-users,
-#umUserMgmtBtn,
-#sideUserMgmtGroup,
-.admin-only-menu,
-.admin-only-nav,
-.user-mgmt-only {
-  display: none !important;
-}
-body.ems-is-admin #tab-users.tab-content.active {
-  display: block !important;
-}
-body.ems-is-admin #umUserMgmtBtn,
-body.ems-is-admin .admin-only-menu,
-body.ems-is-admin .admin-only-nav,
-body.ems-is-admin #sideUserMgmtGroup,
-body.ems-is-admin .user-mgmt-only {
-  display: flex !important;
-}
-body.ems-is-admin #umUserMgmtBtn.umc-item {
-  display: flex !important;
-}
-/* সাব-অ্যাডমিন কখনোই users ট্যাব দেখবে না */
-body.ems-is-subadmin #tab-users,
-body:not(.ems-is-admin) #tab-users {
-  display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-}
-</style>
-
 </body></html>`);
   w.document.close();
 }
@@ -12144,5 +12168,24 @@ input,select,textarea,button{
   }, true);
 })();
 </script>
+
+<!-- ========== SUPABASE AUTH + CLOUD SYNC ========== -->
+<script>
+  // ← এখানে Supabase Project URL ও anon key বসান (খালি = localStorage মোড)
+  window.EMS_SUPABASE = {
+    url: '',       // https://xxxx.supabase.co
+    anonKey: '',   // Project Settings → API → anon public
+    emailDomain: 'jph-ems.local'
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="supabase-cloud.js"></script>
+<!-- ========== END SUPABASE ========== -->
 </body>
+
 </html>
+window.EMS_SUPABASE = {
+  url: 'https://zevhawobhvzinrymxmav.supabase.co',
+  anonKey: 'sb_publishable_7YxOPxNxR8SkD31XwxW5dw_PyCxetee.',
+  emailDomain: 'jph-ems.local'
+};
